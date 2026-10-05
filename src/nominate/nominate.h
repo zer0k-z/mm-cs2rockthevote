@@ -21,7 +21,7 @@ public:
 	// Handle !maps command - list all maps to the player's console
 	void CommandMaps(int slot) const;
 
-	// Handle !reloadmaps command
+	// Handle !reloadmaps command: refetch the map pool from the CS2KZ API
 	void CommandReloadMaps(int slot);
 
 	// Get the ordered list of nominated map names for use in the vote builder.

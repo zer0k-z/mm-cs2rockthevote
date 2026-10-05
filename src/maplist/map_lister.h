@@ -2,9 +2,9 @@
 #define _INCLUDE_RTV_MAP_LISTER_H_
 
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -14,30 +14,29 @@ struct MapEntry
 	std::string mapName;     // Clean name for changelevel, e.g. "kz_grotto"
 	std::string workshopId;  // Workshop ID if present, else empty
 	bool isWorkshop = false;
+	// Added by a lookup for a map outside the approved pool (kept across pool refreshes).
+	bool dynamic = false;
 	// CS2KZ nub_tier per course (1-10), in course order. One entry per course that
 	// has a tier for that mode. Empty = unknown.
 	std::vector<int> classicTiers;
 	std::vector<int> vanillaTiers;
 };
 
-// CS2KZ per-course nub_tiers for a map, cached by clean map name.
-struct TierLists
-{
-	std::vector<int> classic;
-	std::vector<int> vanilla;
-};
-
 class MapLister
 {
 public:
-	// Load maps from file. Returns number of maps loaded, or -1 on error.
-	// If the file doesn't exist, triggers auto-generate from the CS2KZ API.
-	int LoadFromFile(const char *path);
+	// The pool is every approved map on the CS2KZ API, fetched async. There is no local list.
+	// Fetches the full approved list and swaps it in on the game thread.
+	// Entries added by AddDynamicMap survive the swap unless the new pool has them.
+	// onDone(count) runs on the game thread, count is -1 when the fetch failed or one is already running.
+	void RefreshAsync(std::function<void(int)> onDone = nullptr);
 
-	// Reload using the last used path.
-	int Reload();
+	// True when no pool is loaded yet or the loaded one is older than kRefreshIntervalSeconds, and no fetch is running.
+	bool NeedsRefresh() const;
 
-	// Dynamically add a map (from API lookup / off-maplist nomination).
+	static constexpr int kRefreshIntervalSeconds = 1200;
+
+	// Dynamically add a map (from API lookup / off-pool nomination).
 	// Does not write to disk. Returns pointer to the entry.
 	const MapEntry *AddDynamicMap(const MapEntry &entry);
 
@@ -62,7 +61,7 @@ public:
 
 	bool IsLoaded() const
 	{
-		return !m_maps.empty();
+		return m_loaded;
 	}
 
 	// Player-facing label for a map: displayName (or mapName) plus the CS2KZ tier
@@ -82,44 +81,25 @@ public:
 	// Look up a map by name via CS2KZ API.
 	void LookupByNameAsync(const std::string &name, std::function<void(MapEntry)> callback) const;
 
-	// Fetch all approved maps from CS2KZ API and write maplist.txt.
-	// Called automatically when LoadFromFile() returns missing file.
-	void GenerateMaplistAsync(const std::string &outputPath) const;
-
-	// Validate all workshop maps via Steam API.
+	// Validate all workshop maps in the pool via Steam API.
 	// Dead maps are reported to server console and optionally Discord webhook.
 	void ValidateMapsAsync() const;
 
-	// Fetch classic+vanilla tiers for all approved maps from the CS2KZ API into
-	// the tier cache, then apply them to currently loaded maps. Async.
-	void FetchTiersAsync();
-
 private:
 	std::vector<MapEntry> m_maps;
-	std::string m_lastPath;
+	bool m_loaded = false;
+	std::chrono::steady_clock::time_point m_lastRefresh;
 
-	// Cache of CS2KZ tiers keyed by lowercased clean map name -> {classic, vanilla}.
-	// Populated by FetchTiersAsync(); read/written on the game thread only.
-	std::unordered_map<std::string, TierLists> m_tierCache;
+	// True while a pool fetch is in progress. Set on the game thread, cleared on the game thread
+	// once the result is merged, atomic because the fetch itself runs on a worker.
+	std::atomic<bool> m_refreshInFlight {false};
 
-	// True while a tier fetch is in progress. Prevents overlapping API sweeps
-	// when maps change faster than a fetch completes. Set/cleared from both the
-	// game thread and the HTTP worker thread, hence atomic.
-	std::atomic<bool> m_tierFetchInFlight {false};
-
-	// Fill an entry's tiers from m_tierCache if not already set.
-	void ApplyCachedTiers(MapEntry &e) const;
+	// Replace the pool with a fresh fetch, keeping dynamic entries it does not contain.
+	void ApplyPool(std::vector<MapEntry> fresh);
 
 	// Paginate the CS2KZ approved-maps endpoint, parsing tiers into each entry.
 	// onComplete is invoked on a BACKGROUND thread with the full list.
 	static void FetchAllApprovedMapsAsync(std::function<void(std::vector<MapEntry>)> onComplete);
-
-	// Parse a single line into a MapEntry. Returns false if line should be
-	// skipped.
-	static bool ParseLine(const std::string &line, MapEntry &out);
-
-	// Strip the annotation part: "kz_grotto (T3)" -> "kz_grotto"
-	static std::string StripAnnotation(const std::string &displayName);
 
 	// Build a MapEntry from a CS2KZ API JSON map object string fragment.
 	// Returns false if parsing failed.

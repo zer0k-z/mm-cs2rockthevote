@@ -222,7 +222,7 @@ static void ShowMapChooserMenu(int slot)
 		const MapEntry &e = *entry;
 		std::string display = g_MapLister.GetDisplayLabel(e);
 		// Capture a value copy of the entry so we're not holding a pointer into
-		// m_maps, which can reallocate (AddDynamicMap) or be cleared (Reload).
+		// m_maps, which can reallocate (AddDynamicMap) or be replaced (RefreshAsync).
 		MapEntry entryCopy = e;
 		def.AddItem(display,
 					[entryCopy](int playerSlot)
@@ -393,9 +393,11 @@ void CS2RTVPlugin::OnLevelInit(char const *pMapName, char const * /*pMapEntities
 	RTV_LoadConfig(cfgPath, g_RTVConfig);
 	RTV_LoadTranslations();
 
-	char mapPath[512];
-	snprintf(mapPath, sizeof(mapPath), "%s/cfg/maplist.txt", g_SMAPI->GetBaseDir());
-	g_MapLister.LoadFromFile(mapPath);
+	// The pool is the CS2KZ API's approved maps. Fetched on first load, then re-fetched once stale.
+	if (g_MapLister.NeedsRefresh())
+	{
+		g_MapLister.RefreshAsync();
+	}
 
 	g_MapVoteManager.NotifyMapChangeSucceeded(); // cancel failure-detection timer
 												 // before KillAll
@@ -777,7 +779,7 @@ CON_COMMAND_F(mm_listmaps, "List available maps to your console", FCVAR_RELEASE 
 	g_NominateManager.CommandMaps(slot);
 }
 
-CON_COMMAND_F(mm_reloadmaps, "Reload the map list from disk", FCVAR_RELEASE | FCVAR_CLIENT_CAN_EXECUTE)
+CON_COMMAND_F(mm_reloadmaps, "Refetch the map pool from the CS2KZ API", FCVAR_RELEASE | FCVAR_CLIENT_CAN_EXECUTE)
 {
 	int slot = context.GetPlayerSlot().Get();
 	if (!RTV_ConsoleCallerReady(slot))

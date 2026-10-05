@@ -10,8 +10,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <sstream>
 
 MapLister g_MapLister;
@@ -141,83 +143,90 @@ static const char *TierColorCode(int tier)
 	}
 }
 
-std::string MapLister::StripAnnotation(const std::string &displayName)
+bool MapLister::NeedsRefresh() const
 {
-	return mmu::StripMapAnnotation(displayName);
-}
-
-bool MapLister::ParseLine(const std::string &rawLine, MapEntry &out)
-{
-	mmu::MapListEntry parsed;
-	if (!mmu::ParseMapListLine(rawLine, parsed))
+	if (m_refreshInFlight.load())
 	{
 		return false;
 	}
-
-	// Tiers are filled in later by ApplyCachedTiers.
-	out.displayName = parsed.displayName;
-	out.mapName = parsed.mapName;
-	out.workshopId = parsed.workshopId;
-	out.isWorkshop = parsed.isWorkshop;
-	return true;
+	if (!m_loaded)
+	{
+		return true;
+	}
+	return std::chrono::steady_clock::now() - m_lastRefresh >= std::chrono::seconds(kRefreshIntervalSeconds);
 }
 
-int MapLister::LoadFromFile(const char *path)
+void MapLister::RefreshAsync(std::function<void(int)> onDone)
 {
-	m_maps.clear();
-	m_lastPath = path;
-
-	FILE *fp = fopen(path, "r");
-	if (!fp)
+	bool expected = false;
+	if (!m_refreshInFlight.compare_exchange_strong(expected, true))
 	{
-		MMU_LOG_WARN("maplist.txt not found at '%s' - attempting "
-					 "auto-generate from CS2KZ API.\n",
-					 path);
-		GenerateMaplistAsync(path);
-		return -1;
+		if (onDone)
+		{
+			onDone(-1);
+		}
+		return;
 	}
 
-	char line[512];
-	while (fgets(line, sizeof(line), fp))
-	{
-		MapEntry entry;
-		if (ParseLine(std::string(line), entry))
+	FetchAllApprovedMapsAsync(
+		[this, onDone](std::vector<MapEntry> maps)
 		{
-			m_maps.push_back(std::move(entry));
+			auto fresh = std::make_shared<std::vector<MapEntry>>(std::move(maps));
+
+			// Touches m_maps, so merge on the game thread.
+			mmu::http::QueueMainThread(
+				[this, onDone, fresh]()
+				{
+					m_refreshInFlight.store(false);
+
+					if (fresh->empty())
+					{
+						MMU_LOG_WARN("CS2KZ map pool fetch failed or returned no maps.%s\n", m_loaded ? " Keeping the previous pool." : "");
+						if (onDone)
+						{
+							onDone(-1);
+						}
+						return;
+					}
+
+					ApplyPool(std::move(*fresh));
+					MMU_LOG_INFO("Map pool loaded: %d maps from the CS2KZ API.\n", static_cast<int>(m_maps.size()));
+
+					// Dead-map check over the fresh pool, if enabled.
+					if (g_RTVConfig.general.enableMapValidation && !g_RTVConfig.general.steamApiKey.empty())
+					{
+						ValidateMapsAsync();
+					}
+
+					if (onDone)
+					{
+						onDone(static_cast<int>(m_maps.size()));
+					}
+				});
+		});
+}
+
+void MapLister::ApplyPool(std::vector<MapEntry> fresh)
+{
+	std::vector<MapEntry> old = std::move(m_maps);
+	m_maps = std::move(fresh);
+
+	// Keep off-pool nominations resolvable.
+	for (auto &e : old)
+	{
+		if (!e.dynamic)
+		{
+			continue;
+		}
+		bool inPool = FindExact(e.mapName) != nullptr || (!e.workshopId.empty() && FindByWorkshopId(e.workshopId) != nullptr);
+		if (!inPool)
+		{
+			m_maps.push_back(std::move(e));
 		}
 	}
 
-	fclose(fp);
-
-	// Apply any already-cached CS2KZ tiers to the freshly loaded entries.
-	for (auto &e : m_maps)
-	{
-		ApplyCachedTiers(e);
-	}
-
-	// Fetch CS2KZ tiers for display if enabled and not yet cached.
-	std::string tierMode;
-	if (TierDisplayEnabled(tierMode) && m_tierCache.empty())
-	{
-		FetchTiersAsync();
-	}
-
-	// Optionally validate workshop maps in background
-	if (g_RTVConfig.general.enableMapValidation && !g_RTVConfig.general.steamApiKey.empty())
-	{
-		ValidateMapsAsync();
-	}
-
-	return static_cast<int>(m_maps.size());
-}
-
-int MapLister::Reload()
-{
-	if (m_lastPath.empty())
-	{
-		return -1;
-	}
-	return LoadFromFile(m_lastPath.c_str());
+	m_loaded = true;
+	m_lastRefresh = std::chrono::steady_clock::now();
 }
 
 const MapEntry *MapLister::FindExact(const std::string &name) const
@@ -300,6 +309,7 @@ const MapEntry *MapLister::AddDynamicMap(const MapEntry &entry)
 	}
 
 	m_maps.push_back(entry);
+	m_maps.back().dynamic = true;
 	return &m_maps.back();
 }
 
@@ -496,9 +506,8 @@ bool MapLister::ParseCS2KZMapJson(const std::string &jsonObj, MapEntry &out)
 	ParseTierListForMode(jsonObj, "\"classic\"", out.classicTiers);
 	ParseTierListForMode(jsonObj, "\"vanilla\"", out.vanillaTiers);
 
-	// Global maps come straight from the API with no baked tier annotation.
+	// Maps come straight from the API with no baked tier annotation.
 	// tiers are shown live via DisplayKzTiers / GetDisplayLabel.
-	// Manual annotations on non-global maps live only in maplist.txt.
 	out.displayName = name;
 
 	return true;
@@ -704,108 +713,6 @@ void MapLister::FetchAllApprovedMapsAsync(std::function<void(std::vector<MapEntr
 	auto fetcher = std::make_shared<Fetcher>();
 	fetcher->st = state;
 	fetcher->Fetch(fetcher);
-}
-
-void MapLister::GenerateMaplistAsync(const std::string &outputPath) const
-{
-	std::string out = outputPath;
-	FetchAllApprovedMapsAsync(
-		[out](std::vector<MapEntry> maps)
-		{
-			if (maps.empty())
-			{
-				MMU_LOG_INFO("No maps returned from CS2KZ API.\n");
-				return;
-			}
-
-			FILE *fp = fopen(out.c_str(), "w");
-			if (!fp)
-			{
-				MMU_LOG_WARN("Cannot write '%s'.\n", out.c_str());
-				return;
-			}
-
-			for (const auto &e : maps)
-			{
-				if (e.isWorkshop && !e.workshopId.empty())
-				{
-					fprintf(fp, "%s:%s\n", e.displayName.c_str(), e.workshopId.c_str());
-				}
-				else
-				{
-					fprintf(fp, "%s\n", e.mapName.c_str());
-				}
-			}
-			fclose(fp);
-
-			MMU_LOG_INFO("Wrote %d maps to '%s'.\n", static_cast<int>(maps.size()), out.c_str());
-
-			// The load that triggered this found no file, so nothing is in memory yet.
-			mmu::http::QueueMainThread([out]() { g_MapLister.LoadFromFile(out.c_str()); });
-		});
-}
-
-void MapLister::FetchTiersAsync()
-{
-	// Only one paginated sweep at a time. Guards against rapid map changes
-	// re-triggering a fetch before the first one's results are merged.
-	bool expected = false;
-	if (!m_tierFetchInFlight.compare_exchange_strong(expected, true))
-	{
-		return;
-	}
-
-	FetchAllApprovedMapsAsync(
-		[this](std::vector<MapEntry> maps)
-		{
-			if (maps.empty())
-			{
-				// Failed / cancelled - clear the latch so a later load can retry.
-				m_tierFetchInFlight.store(false);
-				return;
-			}
-
-			// Build name -> per-course tier lists on the background thread.
-			auto cache = std::make_shared<std::unordered_map<std::string, TierLists>>();
-			for (const auto &e : maps)
-			{
-				if (e.mapName.empty())
-				{
-					continue;
-				}
-				(*cache)[str::ToLower(e.mapName)] = {e.classicTiers, e.vanillaTiers};
-			}
-
-			// Merge into live state on the game thread (touches m_maps / m_tierCache).
-			mmu::http::QueueMainThread(
-				[this, cache]()
-				{
-					for (const auto &kv : *cache)
-					{
-						m_tierCache[kv.first] = kv.second;
-					}
-					for (auto &e : m_maps)
-					{
-						ApplyCachedTiers(e);
-					}
-					m_tierFetchInFlight.store(false);
-					MMU_LOG_INFO("Loaded CS2KZ tiers for %d maps.\n", static_cast<int>(cache->size()));
-				});
-		});
-}
-
-void MapLister::ApplyCachedTiers(MapEntry &e) const
-{
-	if (!e.classicTiers.empty() || !e.vanillaTiers.empty())
-	{
-		return;
-	}
-	auto it = m_tierCache.find(str::ToLower(e.mapName));
-	if (it != m_tierCache.end())
-	{
-		e.classicTiers = it->second.classic;
-		e.vanillaTiers = it->second.vanilla;
-	}
 }
 
 void SortMapsByName(std::vector<const MapEntry *> &maps)

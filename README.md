@@ -24,12 +24,11 @@ This stops players from spamming it on join before getting kicked to trigger a v
 ### Install
 
 1. Download the [latest release](https://github.com/FemboyKZ/mm-cs2rockthevote/releases/latest) and extract it in your server's root folder (`/game/csgo/`).
-2. Configure the plugin in `core.cfg` and the maplist in `maplist.txt`
+2. Configure the plugin in `core.cfg`. The map pool is every approved map on the [CS2KZ API](https://api.cs2kz.org/maps), fetched on load and refreshed every 20 minutes. There is no local map list.
 
 ### Configuration
 
 * `/cfg/cs2rtv/core.cfg` - Main config file
-* `/cfg/maplist.txt` - Maplist file
 
 ### Commands
 
